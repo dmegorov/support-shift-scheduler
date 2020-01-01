@@ -59,9 +59,9 @@ def hours2range(week_hours):
 
 def setup_dataframes():
     """ Set up dataframes for agents (df_a) and night shift info (df_n). """
-    global min_week_average_hours
+    global min_load_total
 
-    min_week_average_hours = 100  # This will form a baseline for agent history.
+    min_load_total = 100  # This will form a baseline for agent history.
     agents = input_json["agents"]
 
     df_a = pd.DataFrame(
@@ -69,7 +69,7 @@ def setup_dataframes():
         columns=[
             "Handle",
             "Email",
-            "AvgHoursPerWeek",
+            "LoadTotals",
             "PrefIdealLength",
             "Hours",
             "HourRanges",
@@ -86,8 +86,8 @@ def setup_dataframes():
     )
 
     for agent in agents:
-        week_average_hours = math.trunc(float(agent["weekAverageHours"]))
-        min_week_average_hours = min(min_week_average_hours, week_average_hours)
+        agent_load_total = math.trunc(float(agent["weekAverageHours"]))
+        min_load_total = min(min_load_total, agent_load_total)
         week_hours = agent["availableHours"]
 
         for (d, _) in enumerate(week_hours):
@@ -132,7 +132,7 @@ def setup_dataframes():
         df_a.loc[len(df_a)] = {
             "Handle": agent["handle"],
             "Email": agent["email"],
-            "AvgHoursPerWeek": week_average_hours,
+            "LoadTotals": agent_load_total,
             "PrefIdealLength": agent["idealShiftLength"],
             "Hours": week_hours,
             "HourRanges": hour_ranges,
@@ -175,7 +175,7 @@ def remove_agents_not_available_this_week():
         out = True
 
         for d in range(num_days):
-            out = out and (handle in unavailable_employees[d])
+            out = out and (handle in unavailable_employees)
 
         if out:
             df_agents.drop(index=handle, inplace=True)
@@ -184,15 +184,14 @@ def remove_agents_not_available_this_week():
 
 def print_final_schedules(schedule_results):
     """ Print final schedule, validate output JSON, and write to file. """
-    for d in range(num_days):
 
-        print(
-            "\n%s shifts:"
-            % schedule_results[d]["start_date"].strftime("%Y-%m-%d")
-        )
+    print(
+        "\n%s shifts:"
+        % schedule_results[0]["start_date"].strftime("%Y-%m-%d")
+    )
 
-        for (i, e) in enumerate(schedule_results[d]["shifts"]):
-            print(e)
+    for (i, e) in enumerate(schedule_results[0]["shifts"]):
+        print(e)
 
     output_json = []
 
@@ -242,87 +241,59 @@ def print_final_schedules(schedule_results):
     return output_json
 
 
-def generate_schedule_with_ortools():
+def generate_schedule_with_ortools(day):
     """ Create and solve model with OR-Tools, producing final schedule. """
     global df_agents
 
+    # Weight conefficients used by the model
+    undesired_hours_weight = 8
+    shorter_duration_weight = 3
+    longer_duration_weight = 4
+    agent_weight = 8
+    handover_weight = 3
+
+
     # In this function, the following abbreviations are used:
     # t: track
-    # d: day
     # h: Github handle
     # s: slot number
 
     model = cp_model.CpModel()
 
     # Constants / domains:
-    v_constant2 = model.NewIntVar(2, 2, "constant2")
-    d_hourCost = cp_model.Domain.FromValues([0, 80])
+    d_hourCost = cp_model.Domain.FromValues([0, undesired_hours_weight])
     d_duration = cp_model.Domain.FromIntervals(
         [[0, 0], [min_duration, max_duration]]
     )
 
     # Create preference domains:
-    dh_index_array = [[], []]
+    d_prefs = pd.Series(data=None, index=df_agents.index)
 
-    for d in range(num_days):
-        for h in df_agents.index:
-            dh_index_array[0].append(d)
-            dh_index_array[1].append(h)
+    for h in df_agents.index:
+        d_prefs.loc[h] = cp_model.Domain.FromIntervals(
+            df_agents.loc[h, "HourRanges"][day]
+        )
 
-    dh_multi_index = pd.MultiIndex.from_arrays(
-        dh_index_array, names=("Day", "Handle")
-    )
-    d_prefs = pd.Series(data=None, index=dh_multi_index)
-
-    for d in range(num_days):
-        for h in df_agents.index:
-            d_prefs.loc[(d, h)] = cp_model.Domain.FromIntervals(
-                df_agents.loc[h, "HourRanges"][d]
-            )
-
-    # Indexed by handle:
-    v_h = pd.DataFrame(
-        data=None,
-        index=df_agents.index,
-        columns=[
-            "TotalWeekHours",
-            "TotalWeekHoursSquared",
-            "TotalWeekHoursCost",
-        ],
+    # Indexed by track:
+    v_t = pd.DataFrame(
+        data=None, index=pd.RangeIndex(num_tracks), columns=["HandoverCost"]
     )
 
-    # Indexed by track, day:
-    td_index_array = [[], []]
+    # Indexed by track, handle:
+    th_index_array = [[], []]
 
     for t in range(num_tracks):
-        for d in range(num_days):
-            td_index_array[0].append(t)
-            td_index_array[1].append(d)
+        for h in df_agents.index:
+            th_index_array[0].append(t)
+            th_index_array[1].append(h)
 
-    td_multi_index = pd.MultiIndex.from_arrays(
-        td_index_array, names=("Track", "Day")
-    )
-    v_td = pd.DataFrame(
-        data=None, index=td_multi_index, columns=["HandoverCost"]
+    th_multi_index = pd.MultiIndex.from_arrays(
+        th_index_array, names=("Track", "Handle")
     )
 
-    # Indexed by track, day, handle:
-    tdh_index_array = [[], [], []]
-
-    for t in range(num_tracks):
-        for d in range(num_days):
-            for h in df_agents.index:
-                tdh_index_array[0].append(t)
-                tdh_index_array[1].append(d)
-                tdh_index_array[2].append(h)
-
-    tdh_multi_index = pd.MultiIndex.from_arrays(
-        tdh_index_array, names=("Track", "Day", "Handle")
-    )
-
-    v_tdh = pd.DataFrame(
+    v_th = pd.DataFrame(
         data=None,
-        index=tdh_multi_index,
+        index=th_multi_index,
         columns=[
             "Start",
             "End",
@@ -336,25 +307,23 @@ def generate_schedule_with_ortools():
         ],
     )
 
-    # Indexed by track, day, handle, slot:
-    tdhs_index_array = [[], [], [], []]
+    # Indexed by track, handle, slot:
+    ths_index_array = [[], [], []]
 
     for t in range(num_tracks):
-        for d in range(num_days):
-            for h in df_agents.index:
-                for s in range(start_hour, end_hour):
-                    tdhs_index_array[0].append(t)
-                    tdhs_index_array[1].append(d)
-                    tdhs_index_array[2].append(h)
-                    tdhs_index_array[3].append(s)
+        for h in df_agents.index:
+            for s in range(start_hour, end_hour):
+                ths_index_array[0].append(t)
+                ths_index_array[1].append(h)
+                ths_index_array[2].append(s)
 
-    tdhs_multi_index = pd.MultiIndex.from_arrays(
-        tdhs_index_array, names=("Track", "Day", "Handle", "Slot")
+    ths_multi_index = pd.MultiIndex.from_arrays(
+        ths_index_array, names=("Track", "Handle", "Slot")
     )
 
-    v_tdhs = pd.DataFrame(
+    v_ths = pd.DataFrame(
         data=None,
-        index=tdhs_multi_index,
+        index=ths_multi_index,
         columns=[
             "IsStartSmallerEqualHour",
             "IsEndGreaterThanHour",
@@ -365,358 +334,312 @@ def generate_schedule_with_ortools():
 
     # Fill dataframes with variables:
 
-    # h:
-    for h in v_h.index:
-        v_h.loc[h, "TotalWeekHours"] = model.NewIntVar(
-            0, 40, "TotalWeekHours_%s" % h
-        )
-
-        v_h.loc[h, "TotalWeekHoursSquared"] = model.NewIntVarFromDomain(
-            cp_model.Domain.FromValues([x ** 2 for x in range(0, 41)]),
-            "TotalWeekHoursSquared_%s" % h,
-        )
-
-        v_h.loc[h, "TotalWeekHoursCost"] = model.NewIntVarFromDomain(
-            cp_model.Domain.FromValues([2 * x ** 2 for x in range(0, 41)]),
-            "TotalWeekHoursCost_%s" % h,
-        )
-
-    # td:
+    # t:
     for t in range(num_tracks):
-        for d in range(num_days):
-            v_td.loc[(t, d), "HandoverCost"] = model.NewIntVarFromDomain(
-                cp_model.Domain.FromValues([30 * x for x in range(0, 8)]),
-                "HandoverCost_%d_%d" % (t, d),
-            )
+        v_t.loc[t, "HandoverCost"] = model.NewIntVarFromDomain(
+            cp_model.Domain.FromValues([handover_weight * x for x in range(0, 8)]),
+            "HandoverCost_%d" % t,
+        )
 
-    # tdh:
+    # th:
     print("")
 
     for t in range(num_tracks):
-        for d in range(num_days):
-            for h in df_agents.index:
-                when_on_night_shift = [
-                    19 + i
-                    for i, x in enumerate(df_nights.loc[(t, d)].to_list())
-                    if x == h
-                ]
+        for h in df_agents.index:
+            when_on_night_shift = [
+                19 + i
+                for i, x in enumerate(df_nights.loc[(t, day)].to_list())
+                if x == h
+            ]
 
-                if h in unavailable_employees[d]:
-                    v_tdh.loc[(t, d, h), "Start"] = model.NewIntVar(
-                        8, 8, "Start_%d_%d_%s" % (t, d, h)
-                    )
-                    v_tdh.loc[(t, d, h), "End"] = model.NewIntVar(
-                        8, 8, "End_%d_%d_%s" % (t, d, h)
-                    )
-                    v_tdh.loc[(t, d, h), "Duration"] = model.NewIntVar(
-                        0, 0, "Duration_%d_%d_%s" % (t, d, h)
-                    )
-
-                elif len(when_on_night_shift) > 0:
-                    start = when_on_night_shift[0]
-                    end = when_on_night_shift[-1] + 1
-                    duration = end - start
-
-                    v_tdh.loc[(t, d, h), "Start"] = model.NewIntVar(
-                        start, start, "Start_%d_%d_%s" % (t, d, h)
-                    )
-
-                    v_tdh.loc[(t, d, h), "End"] = model.NewIntVar(
-                        end, end, "End_%d_%d_%s" % (t, d, h)
-                    )
-
-                    v_tdh.loc[(t, d, h), "Duration"] = model.NewIntVar(
-                        duration, duration, "Duration_%d_%d_%s" % (t, d, h)
-                    )
-                    print(h + " on duty on night " + str(d + 1))
-
-                else:
-                    v_tdh.loc[(t, d, h), "Start"] = model.NewIntVarFromDomain(
-                        d_prefs.loc[(d, h)], "Start_%d_%d_%s" % (t, d, h)
-                    )
-                    v_tdh.loc[(t, d, h), "End"] = model.NewIntVarFromDomain(
-                        d_prefs.loc[(d, h)], "End_%d_%d_%s" % (t, d, h)
-                    )
-                    v_tdh.loc[
-                        (t, d, h), "Duration"
-                    ] = model.NewIntVarFromDomain(
-                        d_duration, "Duration_%d_%d_%s" % (t, d, h)
-                    )
-
-                v_tdh.loc[(t, d, h), "Interval"] = model.NewIntervalVar(
-                    v_tdh.loc[(t, d, h), "Start"],
-                    v_tdh.loc[(t, d, h), "Duration"],
-                    v_tdh.loc[(t, d, h), "End"],
-                    "Interval_%d_%d_%s" % (t, d, h),
+            if h in unavailable_employees:
+                v_th.loc[(t, h), "Start"] = model.NewIntVar(
+                    8, 8, "Start_%d_%s" % (t, h)
+                )
+                v_th.loc[(t, h), "End"] = model.NewIntVar(
+                    8, 8, "End_%d_%s" % (t, h)
+                )
+                v_th.loc[(t, h), "Duration"] = model.NewIntVar(
+                    0, 0, "Duration_%d_%s" % (t, h)
                 )
 
-                v_tdh.loc[(t, d, h), "IsAgentOn"] = model.NewBoolVar(
-                    "IsAgentOn_%d_%d_%s" % (t, d, h)
+            elif len(when_on_night_shift) > 0:
+                start = when_on_night_shift[0]
+                end = when_on_night_shift[-1] + 1
+                duration = end - start
+
+                v_th.loc[(t, h), "Start"] = model.NewIntVar(
+                    start, start, "Start_%d_%s" % (t, h)
                 )
 
-                v_tdh.loc[(t, d, h), "AgentCost"] = model.NewIntVarFromDomain(
-                    cp_model.Domain.FromValues([30 * x for x in range(0, 65)]),
-                    "AgentCost_%d_%d_%s" % (t, d, h),
+                v_th.loc[(t, h), "End"] = model.NewIntVar(
+                    end, end, "End_%d_%s" % (t, h)
                 )
 
-                v_tdh.loc[
-                    (t, d, h), "IsDurationShorterThanIdeal"
-                ] = model.NewBoolVar(
-                    "IsDurationShorterThanIdeal_%d_%d_%s" % (t, d, h)
+                v_th.loc[(t, h), "Duration"] = model.NewIntVar(
+                    duration, duration, "Duration_%d_%s" % (t, h)
                 )
+                print(h + " on duty on night " + str(day + 1))
 
-                duration_cost_list = set([30 * x for x in range(0, 9)])
-                duration_cost_list = list(
-                    duration_cost_list.union(set([40 * x for x in range(0, 9)]))
+            else:
+                v_th.loc[(t, h), "Start"] = model.NewIntVarFromDomain(
+                    d_prefs.loc[h], "Start_%d_%s" % (t, h)
                 )
-                duration_cost_list.sort()
-
-                v_tdh.loc[
-                    (t, d, h), "DurationCost"
+                v_th.loc[(t, h), "End"] = model.NewIntVarFromDomain(
+                    d_prefs.loc[h], "End_%d_%s" % (t, h)
+                )
+                v_th.loc[
+                    (t, h), "Duration"
                 ] = model.NewIntVarFromDomain(
-                    cp_model.Domain.FromValues(duration_cost_list),
-                    "DurationCost_%d_%d_%s" % (t, d, h),
+                    d_duration, "Duration_%d_%s" % (t, h)
                 )
 
-                v_tdh.loc[(t, d, h), "IsInPrefRange"] = [
-                    model.NewBoolVar("IsInPrefRange_%d_%d_%s_%d" % (t, d, h, j))
-                    for (j, sec) in enumerate(df_agents.loc[h, "HourRanges"][d])
-                ]
+            v_th.loc[(t, h), "Interval"] = model.NewIntervalVar(
+                v_th.loc[(t, h), "Start"],
+                v_th.loc[(t, h), "Duration"],
+                v_th.loc[(t, h), "End"],
+                "Interval_%d_%s" % (t, h),
+            )
 
-    # tdhs:
+            v_th.loc[(t, h), "IsAgentOn"] = model.NewBoolVar(
+                "IsAgentOn_%d_%s" % (t, h)
+            )
+
+            v_th.loc[(t, h), "AgentCost"] = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues([agent_weight * x for x in range(0, 65)]),
+                "AgentCost_%d_%s" % (t, h),
+            )
+
+            v_th.loc[
+                (t, h), "IsDurationShorterThanIdeal"
+            ] = model.NewBoolVar(
+                "IsDurationShorterThanIdeal_%d_%s" % (t, h)
+            )
+
+            duration_cost_list = set([shorter_duration_weight * x for x in range(0, 9)])
+            duration_cost_list = list(
+                duration_cost_list.union(set([longer_duration_weight * x for x in range(0, 9)]))
+            )
+            duration_cost_list.sort()
+
+            v_th.loc[
+                (t, h), "DurationCost"
+            ] = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(duration_cost_list),
+                "DurationCost_%d_%s" % (t, h),
+            )
+
+            v_th.loc[(t, h), "IsInPrefRange"] = [
+                model.NewBoolVar("IsInPrefRange_%d_%s_%d" % (t, h, j))
+                for (j, sec) in enumerate(df_agents.loc[h, "HourRanges"][day])
+            ]
+
+    # ths:
     for t in range(num_tracks):
-        for d in range(num_days):
-            for h in df_agents.index:
-                for s in range(start_hour, end_hour):
-                    v_tdhs.loc[
-                        (t, d, h, s), "IsStartSmallerEqualHour"
-                    ] = model.NewBoolVar(
-                        "IsStartSmallerEqualHour_%d_%d_%s_%d" % (t, d, h, s)
-                    )
+        for h in df_agents.index:
+            for s in range(start_hour, end_hour):
+                v_ths.loc[
+                    (t, h, s), "IsStartSmallerEqualHour"
+                ] = model.NewBoolVar(
+                    "IsStartSmallerEqualHour_%d_%s_%d" % (t, h, s)
+                )
 
-                    v_tdhs.loc[
-                        (t, d, h, s), "IsEndGreaterThanHour"
-                    ] = model.NewBoolVar(
-                        "IsEndGreaterThanHour_%d_%d_%s_%d" % (t, d, h, s)
-                    )
+                v_ths.loc[
+                    (t, h, s), "IsEndGreaterThanHour"
+                ] = model.NewBoolVar(
+                    "IsEndGreaterThanHour_%d_%s_%d" % (t, h, s)
+                )
 
-                    v_tdhs.loc[(t, d, h, s), "IsHourCost"] = model.NewBoolVar(
-                        "IsHourCost_%d_%d_%s_%d" % (t, d, h, s)
-                    )
+                v_ths.loc[(t, h, s), "IsHourCost"] = model.NewBoolVar(
+                    "IsHourCost_%d_%s_%d" % (t, h, s)
+                )
 
-                    v_tdhs.loc[
-                        (t, d, h, s), "HourCost"
-                    ] = model.NewIntVarFromDomain(
-                        d_hourCost, "HourCost_%d_%d_%s_%d" % (t, d, h, s)
-                    )
+                v_ths.loc[
+                    (t, h, s), "HourCost"
+                ] = model.NewIntVarFromDomain(
+                    d_hourCost, "HourCost_%d_%s_%d" % (t, h, s)
+                )
 
     # Constraint: The sum of agents' shifts must equal work_hours:
     for t in range(num_tracks):
-        for d in range(num_days):
-            model.Add(
-                sum(v_tdh.loc[(t, d), "Duration"].values.tolist()) == work_hours
-            )
+        model.Add(
+            sum(v_th.loc[(t), "Duration"].values.tolist()) == work_hours
+        )
 
     # Constraint: Agent shifts must not overlap with each other:
     for t in range(num_tracks):
-        for d in range(num_days):
-            model.AddNoOverlap(v_tdh.loc[(t, d), "Interval"].values.tolist())
+        model.AddNoOverlap(v_th.loc[(t), "Interval"].values.tolist())
 
     # Constraint: Honour agent availability requirements - a shift
     # must start and end within an agent's availability hours:
     # NB: AddBoolOr works with just one boolean as well, in which case that
     # boolean has to be true.
     for t in range(num_tracks):
-        for d in range(num_days):
-            for h in df_agents.index:
-                if not (h in unavailable_employees[d]):
-                    model.AddBoolOr(v_tdh.loc[(t, d, h), "IsInPrefRange"])
+        for h in df_agents.index:
+            if not (h in unavailable_employees):
+                model.AddBoolOr(v_th.loc[(t, h), "IsInPrefRange"])
 
-                    for (j, sec) in enumerate(
-                        df_agents.loc[h, "HourRanges"][d]
-                    ):
-                        model.Add(
-                            v_tdh.loc[(t, d, h), "Start"] >= sec[0]
-                        ).OnlyEnforceIf(
-                            v_tdh.loc[(t, d, h), "IsInPrefRange"][j]
-                        )
-                        model.Add(
-                            v_tdh.loc[(t, d, h), "Start"]
-                            + v_tdh.loc[(t, d, h), "Duration"]
-                            <= sec[1]
-                        ).OnlyEnforceIf(
-                            v_tdh.loc[(t, d, h), "IsInPrefRange"][j]
-                        )
+                for (j, sec) in enumerate(
+                    df_agents.loc[h, "HourRanges"][day]
+                ):
+                    model.Add(
+                        v_th.loc[(t, h), "Start"] >= sec[0]
+                    ).OnlyEnforceIf(
+                        v_th.loc[(t, h), "IsInPrefRange"][j]
+                    )
+                    model.Add(
+                        v_th.loc[(t, h), "Start"]
+                        + v_th.loc[(t, h), "Duration"]
+                        <= sec[1]
+                    ).OnlyEnforceIf(
+                        v_th.loc[(t, h), "IsInPrefRange"][j]
+                    )
 
     # Constraint: Ensure agent not scheduled for more than one track at a time:
-    for d in range(num_days):
-        for h in df_agents.index:
-
-            isAgentOn_list = []
-
-            for t in range(num_tracks):
-                isAgentOn_list.append(v_tdh.loc[(t, d, h), "IsAgentOn"].Not())
-
-            model.AddBoolOr(isAgentOn_list)
-
-    # Constraint: Add cost term due to total hours per agent:
     for h in df_agents.index:
-        model.Add(
-            v_h.loc[h, "TotalWeekHours"]
-            == sum(
-                v_tdh["Duration"]
-                .xs(h, axis=0, level=2, drop_level=False)
-                .values.tolist()
-            )
-        )
 
-        model.AddProdEquality(
-            v_h.loc[h, "TotalWeekHoursSquared"],
-            [v_h.loc[h, "TotalWeekHours"], v_h.loc[h, "TotalWeekHours"]],
-        )
+        isAgentOn_list = []
 
-        model.AddProdEquality(
-            v_h.loc[h, "TotalWeekHoursCost"],
-            [v_constant2, v_h.loc[h, "TotalWeekHoursSquared"]],
-        )
+        for t in range(num_tracks):
+            isAgentOn_list.append(v_th.loc[(t, h), "IsAgentOn"].Not())
+
+        model.AddBoolOr(isAgentOn_list)
 
     # Constraint: Add other cost terms:
     for t in range(num_tracks):
-        for d in range(num_days):
-            # Add cost due to number of handovers:
-            model.Add(
-                v_td.loc[(t, d), "HandoverCost"]
-                == 30
-                * (sum(v_tdh.loc[(t, d), "IsAgentOn"].values.tolist()) - 1)
+        # Add cost due to number of handovers:
+        model.Add(
+            v_t.loc[t, "HandoverCost"]
+            == handover_weight
+            * (sum(v_th.loc[t, "IsAgentOn"].values.tolist()) - 1)
+        )
+
+        for h in df_agents.index:
+            # Put toggles in place reflecting whether agent was assigned:
+            model.Add(v_th.loc[(t, h), "Duration"] != 0).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsAgentOn"]
+            )
+            model.Add(v_th.loc[(t, h), "Duration"] == 0).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsAgentOn"].Not()
             )
 
-            for h in df_agents.index:
-                # Put toggles in place reflecting whether agent was assigned:
-                model.Add(v_tdh.loc[(t, d, h), "Duration"] != 0).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsAgentOn"]
+            # Add cost due to agent history:
+            agent_cost = agent_weight * (
+                df_agents.loc[h, "LoadTotals"] - min_load_total
+            )
+
+            model.Add(
+                v_th.loc[(t, h), "AgentCost"] == agent_cost
+            ).OnlyEnforceIf(v_th.loc[(t, h), "IsAgentOn"])
+            model.Add(v_th.loc[(t, h), "AgentCost"] == 0).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsAgentOn"].Not()
+            )
+
+            # Add cost due to shift duration:
+            model.Add(
+                v_th.loc[(t, h), "Duration"]
+                < df_agents.loc[h, "PrefIdealLength"]
+            ).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsDurationShorterThanIdeal"]
+            )
+            model.Add(
+                v_th.loc[(t, h), "Duration"]
+                >= df_agents.loc[h, "PrefIdealLength"]
+            ).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsDurationShorterThanIdeal"].Not()
+            )
+
+            # Cost for zero duration:
+            model.Add(
+                v_th.loc[(t, h), "DurationCost"] == 0
+            ).OnlyEnforceIf(v_th.loc[(t, h), "IsAgentOn"].Not())
+
+            # Cost for duration shorter than preference:
+            model.Add(
+                v_th.loc[(t, h), "DurationCost"]
+                == shorter_duration_weight
+                * (
+                    df_agents.loc[h, "PrefIdealLength"]
+                    - v_th.loc[(t, h), "Duration"]
                 )
-                model.Add(v_tdh.loc[(t, d, h), "Duration"] == 0).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsAgentOn"].Not()
+            ).OnlyEnforceIf(
+                [
+                    v_th.loc[(t, h), "IsAgentOn"],
+                    v_th.loc[(t, h), "IsDurationShorterThanIdeal"],
+                ]
+            )
+
+            # Cost for duration longer than preference:
+            model.Add(
+                v_th.loc[(t, h), "DurationCost"]
+                == longer_duration_weight
+                * (
+                    v_th.loc[(t, h), "Duration"]
+                    - df_agents.loc[h, "PrefIdealLength"]
+                )
+            ).OnlyEnforceIf(
+                v_th.loc[(t, h), "IsDurationShorterThanIdeal"].Not()
+            )
+
+            # Add hour cost:
+            for (s_count, s_cost) in enumerate(
+                df_agents.loc[h, "Hours"][day][start_hour:end_hour]
+            ):
+
+                s = s_count + start_hour
+
+                model.Add(v_th.loc[(t, h), "Start"] <= s).OnlyEnforceIf(
+                    v_ths.loc[(t, h, s), "IsStartSmallerEqualHour"]
+                )
+                model.Add(v_th.loc[(t, h), "Start"] > s).OnlyEnforceIf(
+                    v_ths.loc[
+                        (t, h, s), "IsStartSmallerEqualHour"
+                    ].Not()
                 )
 
-                # Add cost due to agent history:
-                agent_cost = 30 * (
-                    df_agents.loc[h, "AvgHoursPerWeek"] - min_week_average_hours
+                model.Add(v_th.loc[(t, h), "End"] > s).OnlyEnforceIf(
+                    v_ths.loc[(t, h, s), "IsEndGreaterThanHour"]
+                )
+                model.Add(v_th.loc[(t, h), "End"] <= s).OnlyEnforceIf(
+                    v_ths.loc[(t, h, s), "IsEndGreaterThanHour"].Not()
                 )
 
-                model.Add(
-                    v_tdh.loc[(t, d, h), "AgentCost"] == agent_cost
-                ).OnlyEnforceIf(v_tdh.loc[(t, d, h), "IsAgentOn"])
-                model.Add(v_tdh.loc[(t, d, h), "AgentCost"] == 0).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsAgentOn"].Not()
-                )
-
-                # Add cost due to shift duration:
-                model.Add(
-                    v_tdh.loc[(t, d, h), "Duration"]
-                    < df_agents.loc[h, "PrefIdealLength"]
-                ).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsDurationShorterThanIdeal"]
-                )
-                model.Add(
-                    v_tdh.loc[(t, d, h), "Duration"]
-                    >= df_agents.loc[h, "PrefIdealLength"]
-                ).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsDurationShorterThanIdeal"].Not()
-                )
-
-                # Cost for zero duration:
-                model.Add(
-                    v_tdh.loc[(t, d, h), "DurationCost"] == 0
-                ).OnlyEnforceIf(v_tdh.loc[(t, d, h), "IsAgentOn"].Not())
-
-                # Cost for duration shorter than preference:
-                model.Add(
-                    v_tdh.loc[(t, d, h), "DurationCost"]
-                    == 30
-                    * (
-                        df_agents.loc[h, "PrefIdealLength"]
-                        - v_tdh.loc[(t, d, h), "Duration"]
-                    )
-                ).OnlyEnforceIf(
+                model.AddBoolAnd(
                     [
-                        v_tdh.loc[(t, d, h), "IsAgentOn"],
-                        v_tdh.loc[(t, d, h), "IsDurationShorterThanIdeal"],
+                        v_ths.loc[(t, h, s), "IsStartSmallerEqualHour"],
+                        v_ths.loc[(t, h, s), "IsEndGreaterThanHour"],
                     ]
-                )
+                ).OnlyEnforceIf(v_ths.loc[(t, h, s), "IsHourCost"])
 
-                # Cost for duration longer than preference:
-                model.Add(
-                    v_tdh.loc[(t, d, h), "DurationCost"]
-                    == 40
-                    * (
-                        v_tdh.loc[(t, d, h), "Duration"]
-                        - df_agents.loc[h, "PrefIdealLength"]
-                    )
+                model.AddBoolOr(
+                    [
+                        v_ths.loc[
+                            (t, h, s), "IsStartSmallerEqualHour"
+                        ].Not(),
+                        v_ths.loc[
+                            (t, h, s), "IsEndGreaterThanHour"
+                        ].Not(),
+                    ]
                 ).OnlyEnforceIf(
-                    v_tdh.loc[(t, d, h), "IsDurationShorterThanIdeal"].Not()
+                    v_ths.loc[(t, h, s), "IsHourCost"].Not()
                 )
 
-                # Add hour cost:
-                for (s_count, s_cost) in enumerate(
-                    df_agents.loc[h, "Hours"][d][start_hour:end_hour]
-                ):
+                model.Add(
+                    v_ths.loc[(t, h, s), "HourCost"]
+                    == undesired_hours_weight * (s_cost - 1)
+                ).OnlyEnforceIf(v_ths.loc[(t, h, s), "IsHourCost"])
 
-                    s = s_count + start_hour
-
-                    model.Add(v_tdh.loc[(t, d, h), "Start"] <= s).OnlyEnforceIf(
-                        v_tdhs.loc[(t, d, h, s), "IsStartSmallerEqualHour"]
-                    )
-                    model.Add(v_tdh.loc[(t, d, h), "Start"] > s).OnlyEnforceIf(
-                        v_tdhs.loc[
-                            (t, d, h, s), "IsStartSmallerEqualHour"
-                        ].Not()
-                    )
-
-                    model.Add(v_tdh.loc[(t, d, h), "End"] > s).OnlyEnforceIf(
-                        v_tdhs.loc[(t, d, h, s), "IsEndGreaterThanHour"]
-                    )
-                    model.Add(v_tdh.loc[(t, d, h), "End"] <= s).OnlyEnforceIf(
-                        v_tdhs.loc[(t, d, h, s), "IsEndGreaterThanHour"].Not()
-                    )
-
-                    model.AddBoolAnd(
-                        [
-                            v_tdhs.loc[(t, d, h, s), "IsStartSmallerEqualHour"],
-                            v_tdhs.loc[(t, d, h, s), "IsEndGreaterThanHour"],
-                        ]
-                    ).OnlyEnforceIf(v_tdhs.loc[(t, d, h, s), "IsHourCost"])
-
-                    model.AddBoolOr(
-                        [
-                            v_tdhs.loc[
-                                (t, d, h, s), "IsStartSmallerEqualHour"
-                            ].Not(),
-                            v_tdhs.loc[
-                                (t, d, h, s), "IsEndGreaterThanHour"
-                            ].Not(),
-                        ]
-                    ).OnlyEnforceIf(
-                        v_tdhs.loc[(t, d, h, s), "IsHourCost"].Not()
-                    )
-
-                    model.Add(
-                        v_tdhs.loc[(t, d, h, s), "HourCost"]
-                        == 80 * (s_cost - 1)
-                    ).OnlyEnforceIf(v_tdhs.loc[(t, d, h, s), "IsHourCost"])
-
-                    model.Add(
-                        v_tdhs.loc[(t, d, h, s), "HourCost"] == 0
-                    ).OnlyEnforceIf(
-                        v_tdhs.loc[(t, d, h, s), "IsHourCost"].Not()
-                    )
+                model.Add(
+                    v_ths.loc[(t, h, s), "HourCost"] == 0
+                ).OnlyEnforceIf(
+                    v_ths.loc[(t, h, s), "IsHourCost"].Not()
+                )
 
     full_cost_list = (
-        v_h["TotalWeekHoursCost"].values.tolist()
-        + v_td["HandoverCost"].values.tolist()
-        + v_tdh["AgentCost"].values.tolist()
-        + v_tdh["DurationCost"].values.tolist()
-        + v_tdhs["HourCost"].values.tolist()
+        v_t["HandoverCost"].values.tolist()
+        + v_th["AgentCost"].values.tolist()
+        + v_th["DurationCost"].values.tolist()
+        + v_ths["HourCost"].values.tolist()
     )
 
     model.Minimize(sum(full_cost_list))
@@ -745,23 +668,22 @@ def generate_schedule_with_ortools():
         print("After", solver.WallTime(), "seconds.")
         schedule_results = []
 
-        for d in range(num_days):
-            day_dict = {}
-            day_dict["start_date"] = days[d]
-            day_dict["shifts"] = []
+        day_dict = {}
+        day_dict["start_date"] = days[day]
+        day_dict["shifts"] = []
 
-            for t in range(num_tracks):
-                for h in df_agents.index:
-                    if solver.Value(v_tdh.loc[(t, d, h), "Duration"]) != 0:
-                        day_dict["shifts"].append(
-                            (
-                                h,
-                                solver.Value(v_tdh.loc[(t, d, h), "Start"]),
-                                solver.Value(v_tdh.loc[(t, d, h), "End"]),
-                            )
+        for t in range(num_tracks):
+            for h in df_agents.index:
+                if solver.Value(v_th.loc[(t, h), "Duration"]) != 0:
+                    day_dict["shifts"].append(
+                        (
+                            h,
+                            solver.Value(v_th.loc[(t, h), "Start"]),
+                            solver.Value(v_th.loc[(t, h), "End"]),
                         )
+                    )
 
-            schedule_results.append(day_dict)
+        schedule_results.append(day_dict)
 
         # Sort shifts by start times to improve output readability:
         for i in range(len(schedule_results)):
@@ -781,8 +703,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "-i", "--input", help="Scheduler input JSON file path", required=True
 )
+parser.add_argument(
+    "-d", "--day", type=int, help="A zero-base day index in the input JSON file", required=False, default=0
+)
 args = parser.parse_args()
 input_filename = args.input.strip()
+selected_day = args.day
 
 # Testing (define input directly):
 
@@ -818,6 +744,7 @@ num_slots = 24
 start_date = dateparse(start_Monday).date()
 delta = timedelta(days=1)
 days = [start_date]
+selected_date = start_date + selected_day * delta
 
 for d in range(1, num_days):
     days.append(days[d - 1] + delta)
@@ -825,13 +752,14 @@ for d in range(1, num_days):
 [df_agents, df_nights] = setup_dataframes()
 
 # Determine unavailable agents for each day:
-unavailable_employees = []
+unavailable_employees = get_unavailable_employees(selected_date)
+'''unavailable_employees = []
 
 for d in range(num_days):
-    unavailable_employees.append(get_unavailable_employees(days[d]))
+    unavailable_employees.append(get_unavailable_employees(days[d]))'''
 
 # Remove agents from the model who are not available at all this week:
 remove_agents_not_available_this_week()
 
 # Create schedule:
-output_sched = generate_schedule_with_ortools()
+output_sched = generate_schedule_with_ortools(selected_day)
